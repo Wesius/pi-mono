@@ -1,0 +1,40 @@
+{
+	"name": "@anthropic/pi-messages",
+	"version": "0.1.0",
+	"description": "macOS Messages (iMessage/SMS) integration for pi — read conversations, search, and send messages",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist",
+		"skills",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"dependencies": {
+		"@mariozechner/pi-coding-agent": "^0.66.1",
+		"@sinclair/typebox": "^0.34.41",
+		"better-sqlite3": "^11.9.1"
+	},
+	"devDependencies": {
+		"@types/better-sqlite3": "^7.6.13",
+		"@types/node": "^24.3.0"
+	},
+	"keywords": [
+		"pi",
+		"imessage",
+		"macos",
+		"messages",
+		"sms"
+	],
+	"author": "Wes Griffin",
+	"license": "MIT",
+	"engines": {
+		"node": ">=20.0.0"
+	}
+}

@@ -1,0 +1,38 @@
+{
+	"name": "@anthropic/pi-notion",
+	"version": "0.1.0",
+	"description": "Notion integration for pi — search, read, create, update pages and databases",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"files": [
+		"dist",
+		"skills",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"dependencies": {
+		"@mariozechner/pi-coding-agent": "^0.66.1",
+		"@notionhq/client": "^5.17.0",
+		"@sinclair/typebox": "^0.34.41"
+	},
+	"devDependencies": {
+		"@types/node": "^24.3.0"
+	},
+	"keywords": [
+		"pi",
+		"notion",
+		"api",
+		"integration"
+	],
+	"author": "Wes Griffin",
+	"license": "MIT",
+	"engines": {
+		"node": ">=20.0.0"
+	}
+}
