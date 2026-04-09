@@ -14,6 +14,56 @@ function appleTimestampToISO(ts: number | null): string {
 	return new Date(unixTs * 1000).toISOString();
 }
 
+/**
+ * Extract text from NSAttributedString's attributedBody blob.
+ * macOS Ventura+ stores message text in attributedBody (NSKeyedArchiver/typedstream)
+ * instead of the `text` column.
+ */
+function extractTextFromAttributedBody(attributedBody: Buffer | null): string | null {
+	if (!attributedBody) return null;
+	const buf = Buffer.from(attributedBody);
+
+	const nsStringMarker = Buffer.from("NSString");
+	const nsIdx = buf.indexOf(nsStringMarker);
+	if (nsIdx < 0) return null;
+
+	// Layout after "NSString": 0x01 + 3 metadata bytes + 0x2b + length + text
+	let pos = nsIdx + 13; // 8 (marker) + 1 + 3 + 1 (0x2b)
+	if (pos >= buf.length) return null;
+
+	// Decode variable-length encoding
+	let textLen: number;
+	const lenByte = buf[pos];
+	if (lenByte < 0x80) {
+		textLen = lenByte;
+		pos += 1;
+	} else if (lenByte === 0x81) {
+		if (pos + 2 >= buf.length) return null;
+		textLen = buf[pos + 1] | (buf[pos + 2] << 8);
+		pos += 3;
+	} else if (lenByte === 0x82) {
+		if (pos + 3 >= buf.length) return null;
+		textLen = buf[pos + 1] | (buf[pos + 2] << 8) | (buf[pos + 3] << 16);
+		pos += 4;
+	} else {
+		return null;
+	}
+
+	if (pos + textLen > buf.length) return null;
+	const text = buf.slice(pos, pos + textLen).toString("utf-8");
+	// Remove object replacement characters (used for inline attachments)
+	return text.replace(/\ufffc/g, "").trim() || null;
+}
+
+/**
+ * Get the text of a message, falling back to attributedBody extraction
+ * when the text column is NULL (macOS Ventura+).
+ */
+function getMessageText(text: string | null, attributedBody: Buffer | null): string | null {
+	if (text) return text;
+	return extractTextFromAttributedBody(attributedBody);
+}
+
 function getDb(): Database.Database {
 	if (!existsSync(DB_PATH)) {
 		throw new Error(`Messages database not found at ${DB_PATH}`);
@@ -38,19 +88,21 @@ export interface Conversation {
 export function getRecent(limit: number): Message[] {
 	const db = getDb();
 	try {
+		// Fetch more than requested since some may have no extractable text
 		const rows = db
 			.prepare(
-				`SELECT m.text, m.is_from_me, m.date AS msg_date,
+				`SELECT m.text, m.attributedBody, m.is_from_me, m.date AS msg_date,
 					h.id AS sender_id, c.display_name AS chat_name, c.chat_identifier
 				FROM message m
 				LEFT JOIN handle h ON m.handle_id = h.ROWID
 				LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 				LEFT JOIN chat c ON cmj.chat_id = c.ROWID
-				WHERE m.text IS NOT NULL AND m.text != ''
+				WHERE m.text IS NOT NULL OR m.attributedBody IS NOT NULL
 				ORDER BY m.date DESC LIMIT ?`,
 			)
-			.all(limit) as Array<{
-			text: string;
+			.all(limit * 2) as Array<{
+			text: string | null;
+			attributedBody: Buffer | null;
 			is_from_me: number;
 			msg_date: number;
 			sender_id: string | null;
@@ -58,12 +110,19 @@ export function getRecent(limit: number): Message[] {
 			chat_identifier: string | null;
 		}>;
 
-		return rows.map((row) => ({
-			sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
-			text: row.text,
-			date: appleTimestampToISO(row.msg_date),
-			chat: row.chat_name || resolveSender(row.chat_identifier) || "",
-		}));
+		const results: Message[] = [];
+		for (const row of rows) {
+			if (results.length >= limit) break;
+			const text = getMessageText(row.text, row.attributedBody);
+			if (!text) continue;
+			results.push({
+				sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
+				text,
+				date: appleTimestampToISO(row.msg_date),
+				chat: row.chat_name || resolveSender(row.chat_identifier) || "",
+			});
+		}
+		return results;
 	} finally {
 		db.close();
 	}
@@ -83,7 +142,8 @@ export function getConversation(contact: string, limit: number): Message[] {
 	const db = getDb();
 	try {
 		let rows: Array<{
-			text: string;
+			text: string | null;
+			attributedBody: Buffer | null;
 			is_from_me: number;
 			msg_date: number;
 			sender_id: string | null;
@@ -94,39 +154,46 @@ export function getConversation(contact: string, limit: number): Message[] {
 			const likeParam = `%${contact}%`;
 			rows = db
 				.prepare(
-					`SELECT m.text, m.is_from_me, m.date AS msg_date, h.id AS sender_id
+					`SELECT m.text, m.attributedBody, m.is_from_me, m.date AS msg_date, h.id AS sender_id
 					FROM message m
 					LEFT JOIN handle h ON m.handle_id = h.ROWID
 					LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 					LEFT JOIN chat c ON cmj.chat_id = c.ROWID
-					WHERE m.text IS NOT NULL AND m.text != ''
+					WHERE (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
 						AND (h.id IN (${placeholders})
 							OR c.chat_identifier LIKE ?
 							OR c.display_name LIKE ?)
 					ORDER BY m.date DESC LIMIT ?`,
 				)
-				.all(...handleMatches, likeParam, likeParam, limit) as typeof rows;
+				.all(...handleMatches, likeParam, likeParam, limit * 2) as typeof rows;
 		} else {
 			const likeParam = `%${contact}%`;
 			rows = db
 				.prepare(
-					`SELECT m.text, m.is_from_me, m.date AS msg_date, h.id AS sender_id
+					`SELECT m.text, m.attributedBody, m.is_from_me, m.date AS msg_date, h.id AS sender_id
 					FROM message m
 					LEFT JOIN handle h ON m.handle_id = h.ROWID
 					LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
 					LEFT JOIN chat c ON cmj.chat_id = c.ROWID
-					WHERE m.text IS NOT NULL AND m.text != ''
+					WHERE (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
 						AND (h.id LIKE ? OR c.chat_identifier LIKE ? OR c.display_name LIKE ?)
 					ORDER BY m.date DESC LIMIT ?`,
 				)
-				.all(likeParam, likeParam, likeParam, limit) as typeof rows;
+				.all(likeParam, likeParam, likeParam, limit * 2) as typeof rows;
 		}
 
-		return rows.map((row) => ({
-			sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
-			text: row.text,
-			date: appleTimestampToISO(row.msg_date),
-		}));
+		const results: Message[] = [];
+		for (const row of rows) {
+			if (results.length >= limit) break;
+			const text = getMessageText(row.text, row.attributedBody);
+			if (!text) continue;
+			results.push({
+				sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
+				text,
+				date: appleTimestampToISO(row.msg_date),
+			});
+		}
+		return results;
 	} finally {
 		db.close();
 	}
@@ -135,33 +202,53 @@ export function getConversation(contact: string, limit: number): Message[] {
 export function listConversations(limit: number): Conversation[] {
 	const db = getDb();
 	try {
+		// Get conversations with the most recent message date, then extract text in JS
 		const rows = db
 			.prepare(
-				`SELECT c.chat_identifier, c.display_name,
-					(SELECT m2.text FROM message m2
-					 JOIN chat_message_join cmj2 ON m2.ROWID = cmj2.message_id
-					 WHERE cmj2.chat_id = c.ROWID AND m2.text IS NOT NULL AND m2.text != ''
-					 ORDER BY m2.date DESC LIMIT 1) AS last_message,
+				`SELECT c.ROWID AS chat_rowid, c.chat_identifier, c.display_name,
 					(SELECT m3.date FROM message m3
 					 JOIN chat_message_join cmj3 ON m3.ROWID = cmj3.message_id
 					 WHERE cmj3.chat_id = c.ROWID
 					 ORDER BY m3.date DESC LIMIT 1) AS last_date
-				FROM chat c WHERE last_message IS NOT NULL
+				FROM chat c WHERE last_date IS NOT NULL
 				ORDER BY last_date DESC LIMIT ?`,
 			)
 			.all(limit) as Array<{
+			chat_rowid: number;
 			chat_identifier: string;
 			display_name: string | null;
-			last_message: string;
 			last_date: number;
 		}>;
 
-		return rows.map((row) => ({
-			chat_identifier: row.chat_identifier,
-			display_name: row.display_name || resolveSender(row.chat_identifier) || "",
-			last_message: (row.last_message || "").slice(0, 100),
-			last_date: appleTimestampToISO(row.last_date),
-		}));
+		// For each conversation, get the most recent message with text
+		const getLastMsg = db.prepare(
+			`SELECT m.text, m.attributedBody FROM message m
+			 JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+			 WHERE cmj.chat_id = ?
+			 ORDER BY m.date DESC LIMIT 5`,
+		);
+
+		return rows.map((row) => {
+			let lastMessage = "";
+			const msgs = getLastMsg.all(row.chat_rowid) as Array<{
+				text: string | null;
+				attributedBody: Buffer | null;
+			}>;
+			for (const msg of msgs) {
+				const text = getMessageText(msg.text, msg.attributedBody);
+				if (text) {
+					lastMessage = text.slice(0, 100);
+					break;
+				}
+			}
+
+			return {
+				chat_identifier: row.chat_identifier,
+				display_name: row.display_name || resolveSender(row.chat_identifier) || "",
+				last_message: lastMessage,
+				last_date: appleTimestampToISO(row.last_date),
+			};
+		});
 	} finally {
 		db.close();
 	}
@@ -170,9 +257,11 @@ export function listConversations(limit: number): Conversation[] {
 export function searchMessages(query: string, limit: number): Message[] {
 	const db = getDb();
 	try {
-		const rows = db
+		// Search in both text column and by extracting from attributedBody
+		// For text column matches:
+		const textRows = db
 			.prepare(
-				`SELECT m.text, m.is_from_me, m.date AS msg_date,
+				`SELECT m.text, m.attributedBody, m.is_from_me, m.date AS msg_date,
 					h.id AS sender_id, c.display_name AS chat_name, c.chat_identifier
 				FROM message m
 				LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -182,7 +271,8 @@ export function searchMessages(query: string, limit: number): Message[] {
 				ORDER BY m.date DESC LIMIT ?`,
 			)
 			.all(`%${query}%`, limit) as Array<{
-			text: string;
+			text: string | null;
+			attributedBody: Buffer | null;
 			is_from_me: number;
 			msg_date: number;
 			sender_id: string | null;
@@ -190,12 +280,58 @@ export function searchMessages(query: string, limit: number): Message[] {
 			chat_identifier: string | null;
 		}>;
 
-		return rows.map((row) => ({
-			sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
-			text: row.text,
-			date: appleTimestampToISO(row.msg_date),
-			chat: row.chat_name || resolveSender(row.chat_identifier) || "",
-		}));
+		// Also search in attributedBody - we need to scan messages and extract text
+		// This is slower but necessary for Ventura+ where text column is NULL
+		const abRows = db
+			.prepare(
+				`SELECT m.text, m.attributedBody, m.is_from_me, m.date AS msg_date,
+					h.id AS sender_id, c.display_name AS chat_name, c.chat_identifier
+				FROM message m
+				LEFT JOIN handle h ON m.handle_id = h.ROWID
+				LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+				LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+				WHERE m.text IS NULL AND m.attributedBody IS NOT NULL
+				ORDER BY m.date DESC LIMIT ?`,
+			)
+			.all(limit * 20) as typeof textRows;
+
+		const seen = new Set<string>();
+		const results: Message[] = [];
+
+		// Add text column matches first
+		for (const row of textRows) {
+			if (results.length >= limit) break;
+			const text = getMessageText(row.text, row.attributedBody);
+			if (!text) continue;
+			const key = `${row.msg_date}-${row.sender_id}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			results.push({
+				sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
+				text,
+				date: appleTimestampToISO(row.msg_date),
+				chat: row.chat_name || resolveSender(row.chat_identifier) || "",
+			});
+		}
+
+		// Then search attributedBody extractions
+		const queryLower = query.toLowerCase();
+		for (const row of abRows) {
+			if (results.length >= limit) break;
+			const text = extractTextFromAttributedBody(row.attributedBody);
+			if (!text || !text.toLowerCase().includes(queryLower)) continue;
+			const key = `${row.msg_date}-${row.sender_id}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			results.push({
+				sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
+				text,
+				date: appleTimestampToISO(row.msg_date),
+				chat: row.chat_name || resolveSender(row.chat_identifier) || "",
+			});
+		}
+
+		return results;
 	} finally {
 		db.close();
 	}
