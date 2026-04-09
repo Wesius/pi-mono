@@ -8,6 +8,29 @@ import { loadContacts, resolveRecipient, resolveSender } from "./contacts.js";
 const DB_PATH = join(homedir(), "Library", "Messages", "chat.db");
 const APPLE_EPOCH_OFFSET = 978307200;
 
+/**
+ * For unnamed group chats, resolve participant names as a comma-separated list.
+ * Returns null if not a group chat or no participants found.
+ */
+function resolveGroupChatName(db: Database.Database, chatIdentifier: string): string | null {
+	const chat = db.prepare("SELECT ROWID, style FROM chat WHERE chat_identifier = ?").get(chatIdentifier) as
+		| { ROWID: number; style: number }
+		| undefined;
+	if (!chat || chat.style !== 43) return null; // style 43 = group chat
+
+	const handles = db
+		.prepare(
+			`SELECT h.id FROM handle h
+			JOIN chat_handle_join chj ON h.ROWID = chj.handle_id
+			WHERE chj.chat_id = ?`,
+		)
+		.all(chat.ROWID) as Array<{ id: string }>;
+
+	if (handles.length === 0) return null;
+	const names = handles.map((h) => resolveSender(h.id));
+	return names.join(", ");
+}
+
 function appleTimestampToISO(ts: number | null): string {
 	if (!ts || ts === 0) return "";
 	const unixTs = ts / 1_000_000_000 + APPLE_EPOCH_OFFSET;
@@ -62,6 +85,19 @@ function extractTextFromAttributedBody(attributedBody: Buffer | null): string | 
 function getMessageText(text: string | null, attributedBody: Buffer | null): string | null {
 	if (text) return text;
 	return extractTextFromAttributedBody(attributedBody);
+}
+
+/**
+ * Resolve a chat display name, falling back to contact lookup then group participant names.
+ */
+function resolveChatName(db: Database.Database, chatName: string | null, chatIdentifier: string | null): string {
+	if (chatName) return chatName;
+	if (!chatIdentifier) return "";
+	const contactName = resolveSender(chatIdentifier);
+	if (contactName === chatIdentifier) {
+		return resolveGroupChatName(db, chatIdentifier) || chatIdentifier;
+	}
+	return contactName;
 }
 
 function getDb(): Database.Database {
@@ -119,7 +155,7 @@ export function getRecent(limit: number): Message[] {
 				sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
 				text,
 				date: appleTimestampToISO(row.msg_date),
-				chat: row.chat_name || resolveSender(row.chat_identifier) || "",
+				chat: resolveChatName(db, row.chat_name, row.chat_identifier),
 			});
 		}
 		return results;
@@ -244,7 +280,7 @@ export function listConversations(limit: number): Conversation[] {
 
 			return {
 				chat_identifier: row.chat_identifier,
-				display_name: row.display_name || resolveSender(row.chat_identifier) || "",
+				display_name: row.display_name || resolveChatName(db, null, row.chat_identifier),
 				last_message: lastMessage,
 				last_date: appleTimestampToISO(row.last_date),
 			};
@@ -310,7 +346,7 @@ export function searchMessages(query: string, limit: number): Message[] {
 				sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
 				text,
 				date: appleTimestampToISO(row.msg_date),
-				chat: row.chat_name || resolveSender(row.chat_identifier) || "",
+				chat: resolveChatName(db, row.chat_name, row.chat_identifier),
 			});
 		}
 
@@ -327,7 +363,7 @@ export function searchMessages(query: string, limit: number): Message[] {
 				sender: row.is_from_me ? "me" : resolveSender(row.sender_id),
 				text,
 				date: appleTimestampToISO(row.msg_date),
-				chat: row.chat_name || resolveSender(row.chat_identifier) || "",
+				chat: resolveChatName(db, row.chat_name, row.chat_identifier),
 			});
 		}
 
