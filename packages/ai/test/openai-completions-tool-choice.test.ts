@@ -1,4 +1,4 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getModel } from "../src/models.js";
 import { streamSimple } from "../src/stream.js";
@@ -24,9 +24,9 @@ vi.mock("openai", () => {
 	class FakeOpenAI {
 		chat = {
 			completions: {
-				create: async (params: unknown) => {
+				create: (params: unknown) => {
 					mockState.lastParams = params;
-					return {
+					const stream = {
 						async *[Symbol.asyncIterator]() {
 							const chunks = mockState.chunks ?? [
 								{
@@ -44,6 +44,17 @@ vi.mock("openai", () => {
 							}
 						},
 					};
+					const promise = Promise.resolve(stream) as Promise<typeof stream> & {
+						withResponse: () => Promise<{
+							data: typeof stream;
+							response: { status: number; headers: Headers };
+						}>;
+					};
+					promise.withResponse = async () => ({
+						data: stream,
+						response: { status: 200, headers: new Headers() },
+					});
+					return promise;
 				},
 			},
 		};

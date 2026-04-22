@@ -1,5 +1,6 @@
 import type { Transport } from "@mariozechner/pi-ai";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
@@ -24,6 +25,7 @@ export interface RetrySettings {
 
 export interface TerminalSettings {
 	showImages?: boolean; // default: true (only relevant if terminal supports images)
+	imageWidthCells?: number; // default: 60 (preferred inline image width in terminal cells)
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 }
 
@@ -78,6 +80,7 @@ export interface Settings {
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
 	collapseChangelog?: boolean; // Show condensed changelog after update (use /changelog for full)
+	enableInstallTelemetry?: boolean; // default: true - anonymous version/update ping after changelog-detected updates
 	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
 	extensions?: string[]; // Array of local extension file paths or directories
 	skills?: string[]; // Array of local skill file paths or directories
@@ -143,7 +146,7 @@ export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
 	private projectSettingsPath: string;
 
-	constructor(cwd: string = process.cwd(), agentDir: string = getAgentDir()) {
+	constructor(cwd: string, agentDir: string) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
 	}
@@ -255,7 +258,7 @@ export class SettingsManager {
 	}
 
 	/** Create a SettingsManager that loads from files */
-	static create(cwd: string = process.cwd(), agentDir: string = getAgentDir()): SettingsManager {
+	static create(cwd: string, agentDir: string = getAgentDir()): SettingsManager {
 		const storage = new FileSettingsStorage(cwd, agentDir);
 		return SettingsManager.fromStorage(storage);
 	}
@@ -533,7 +536,17 @@ export class SettingsManager {
 	}
 
 	getSessionDir(): string | undefined {
-		return this.settings.sessionDir;
+		const sessionDir = this.settings.sessionDir;
+		if (!sessionDir) {
+			return sessionDir;
+		}
+		if (sessionDir === "~") {
+			return homedir();
+		}
+		if (sessionDir.startsWith("~/")) {
+			return join(homedir(), sessionDir.slice(2));
+		}
+		return sessionDir;
 	}
 
 	getDefaultProvider(): string | undefined {
@@ -736,6 +749,16 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getEnableInstallTelemetry(): boolean {
+		return this.settings.enableInstallTelemetry ?? true;
+	}
+
+	setEnableInstallTelemetry(enabled: boolean): void {
+		this.globalSettings.enableInstallTelemetry = enabled;
+		this.markModified("enableInstallTelemetry");
+		this.save();
+	}
+
 	getPackages(): PackageSource[] {
 		return [...(this.settings.packages ?? [])];
 	}
@@ -845,6 +868,23 @@ export class SettingsManager {
 		}
 		this.globalSettings.terminal.showImages = show;
 		this.markModified("terminal", "showImages");
+		this.save();
+	}
+
+	getImageWidthCells(): number {
+		const width = this.settings.terminal?.imageWidthCells;
+		if (typeof width !== "number" || !Number.isFinite(width)) {
+			return 60;
+		}
+		return Math.max(1, Math.floor(width));
+	}
+
+	setImageWidthCells(width: number): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.imageWidthCells = Math.max(1, Math.floor(width));
+		this.markModified("terminal", "imageWidthCells");
 		this.save();
 	}
 
